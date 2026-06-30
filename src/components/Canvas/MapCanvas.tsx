@@ -157,6 +157,9 @@ export const MapCanvas = forwardRef<HTMLCanvasElement, MapCanvasProps>(
     }
 
     // ===== ドラッグ（Image座標で管理）=====
+    // ポインターキャプチャは再レンダリングで消えないSVGルート(svgRef)に付与する。
+    // 個々の<g>はpx/py更新のたびに作り直されるため、そこにキャプチャを付けると
+    // ドラッグが途中で切れてしまう（つかんで動かして離せない不具合の原因）。
     const handlePinPointerDown = useCallback((e: React.PointerEvent, pinId: string) => {
       e.stopPropagation()
       const pin = pins.find(p => p.id === pinId)
@@ -167,34 +170,42 @@ export const MapCanvas = forwardRef<HTMLCanvasElement, MapCanvasProps>(
         origImageX: pin.px, origImageY: pin.py,   // Image座標
         active: false,
       }
-      ;(e.currentTarget as SVGElement).setPointerCapture(e.pointerId)
+      // SVGルートにキャプチャ（再レンダリングされない安定要素）
+      if (svgRef.current) {
+        try { svgRef.current.setPointerCapture(e.pointerId) } catch {}
+      }
       onSelectPin(pinId)
     }, [pins, onSelectPin])
 
-    const handlePinPointerMove = useCallback((e: React.PointerEvent, pinId: string) => {
-      if (!dragRef.current || dragRef.current.pinId !== pinId) return
-      const dcx = e.clientX - dragRef.current.startClientX
-      const dcy = e.clientY - dragRef.current.startClientY
-      if (!dragRef.current.active && Math.sqrt(dcx*dcx + dcy*dcy) > 4) {
-        dragRef.current.active = true
+    // SVGルートで move/up を処理（ドラッグ中の全ポインター移動を確実に受ける）
+    const handleRootPointerMove = useCallback((e: React.PointerEvent) => {
+      const drag = dragRef.current
+      if (!drag) return
+      const dcx = e.clientX - drag.startClientX
+      const dcy = e.clientY - drag.startClientY
+      if (!drag.active && Math.sqrt(dcx*dcx + dcy*dcy) > 4) {
+        drag.active = true
       }
-      if (!dragRef.current.active) return
+      if (!drag.active) return
 
-      // クライアント座標の差分 → Image座標の差分（/ zoomScale）
       const dImgX = dcx / zoomScale
       const dImgY = dcy / zoomScale
-      const newImgX = pageW > 0 ? Math.max(0, Math.min(pageW, dragRef.current.origImageX + dImgX)) : dragRef.current.origImageX + dImgX
-      const newImgY = pageH > 0 ? Math.max(0, Math.min(pageH, dragRef.current.origImageY + dImgY)) : dragRef.current.origImageY + dImgY
-      onUpdatePin(pinId, { px: newImgX, py: newImgY })
+      const newImgX = pageW > 0 ? Math.max(0, Math.min(pageW, drag.origImageX + dImgX)) : drag.origImageX + dImgX
+      const newImgY = pageH > 0 ? Math.max(0, Math.min(pageH, drag.origImageY + dImgY)) : drag.origImageY + dImgY
+      onUpdatePin(drag.pinId, { px: newImgX, py: newImgY })
     }, [zoomScale, pageW, pageH, onUpdatePin])
 
-    const handlePinPointerUp = useCallback((_e: React.PointerEvent, pinId: string) => {
-      if (!dragRef.current || dragRef.current.pinId !== pinId) return
-      if (dragRef.current.active && calib.ready) {
-        const pin = pins.find(p => p.id === pinId)
+    const handleRootPointerUp = useCallback((e: React.PointerEvent) => {
+      const drag = dragRef.current
+      if (!drag) return
+      if (svgRef.current) {
+        try { svgRef.current.releasePointerCapture(e.pointerId) } catch {}
+      }
+      if (drag.active && calib.ready) {
+        const pin = pins.find(p => p.id === drag.pinId)
         if (pin) {
           const ll = pxToLatLng(pin.px, pin.py, calib.points)
-          onUpdatePin(pinId, { lat: ll.lat, lng: ll.lng, moved: true })
+          onUpdatePin(drag.pinId, { lat: ll.lat, lng: ll.lng, moved: true })
         }
       }
       dragRef.current = null
@@ -225,8 +236,6 @@ export const MapCanvas = forwardRef<HTMLCanvasElement, MapCanvasProps>(
       return (
         <g
           onPointerDown={e => handlePinPointerDown(e, pin.id)}
-          onPointerMove={e => handlePinPointerMove(e, pin.id)}
-          onPointerUp={e => handlePinPointerUp(e, pin.id)}
           onClick={ev => { ev.stopPropagation(); onSelectPin(pin.id) }}
           style={{ cursor: 'grab', touchAction: 'none' }}
         >
@@ -291,7 +300,10 @@ export const MapCanvas = forwardRef<HTMLCanvasElement, MapCanvasProps>(
           <div className="relative inline-block flex-shrink-0">
             <canvas ref={ref} className="block shadow-md" />
             <svg ref={svgRef} className="absolute top-0 left-0 overflow-visible"
-              style={{ pointerEvents: 'none' }}>
+              style={{ pointerEvents: 'none' }}
+              onPointerMove={handleRootPointerMove}
+              onPointerUp={handleRootPointerUp}
+              onPointerCancel={handleRootPointerUp}>
               <g style={{ pointerEvents: 'all' }}>
                 {calib.points.map((pt, i) =>
                   pt.px !== undefined
